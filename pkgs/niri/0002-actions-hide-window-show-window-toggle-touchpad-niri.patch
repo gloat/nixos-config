@@ -1,0 +1,727 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: gloat <4354076+gloat@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 08:55:31 -0500
+Subject: [PATCH] actions: hide-window, show-window, toggle-touchpad; `niri msg
+ touchpad`
+
+hide-window [--id] takes a window out of its workspace without closing it; show-window [--id]
+brings it back (default: the most recently hidden) on the focused workspace, focused, with the
+open animation, floating or tiled as before. Hidden windows live in Layout::hidden: listed over
+IPC with no workspace id, kept current on commit, forgotten when unmapped or destroyed, and out of
+reach of every other action and request (they are not in windows() or find_window_and_output()).
+
+toggle-touchpad turns the touchpad off or back on on top of the config; `niri msg touchpad`
+(or -j) reports whether it is on.
+---
+ niri-config/src/binds.rs   |  12 ++++
+ niri-ipc/src/lib.rs        |  35 ++++++++++++
+ src/cli.rs                 |   2 +
+ src/handlers/compositor.rs |  29 ++++++++++
+ src/handlers/xdg_shell.rs  |  15 +++++
+ src/input/mod.rs           |  52 +++++++++++++++--
+ src/ipc/client.rs          |  19 ++++++-
+ src/ipc/server.rs          |  13 ++++-
+ src/layout/mod.rs          | 113 +++++++++++++++++++++++++++++++++++++
+ src/layout/tests.rs        |  88 +++++++++++++++++++++++++++++
+ src/niri.rs                |  32 ++++++++++-
+ 11 files changed, 402 insertions(+), 8 deletions(-)
+
+diff --git a/niri-config/src/binds.rs b/niri-config/src/binds.rs
+index 0be7596f..8d763260 100644
+--- a/niri-config/src/binds.rs
++++ b/niri-config/src/binds.rs
+@@ -148,6 +148,13 @@ pub enum Action {
+     CloseWindow,
+     #[knuffel(skip)]
+     CloseWindowById(u64),
++    HideWindow,
++    #[knuffel(skip)]
++    HideWindowById(u64),
++    ShowWindow,
++    #[knuffel(skip)]
++    ShowWindowById(u64),
++    ToggleTouchpad,
+     FullscreenWindow,
+     #[knuffel(skip)]
+     FullscreenWindowById(u64),
+@@ -431,6 +438,11 @@ impl From<niri_ipc::Action> for Action {
+             }
+             niri_ipc::Action::CloseWindow { id: None } => Self::CloseWindow,
+             niri_ipc::Action::CloseWindow { id: Some(id) } => Self::CloseWindowById(id),
++            niri_ipc::Action::HideWindow { id: None } => Self::HideWindow,
++            niri_ipc::Action::HideWindow { id: Some(id) } => Self::HideWindowById(id),
++            niri_ipc::Action::ShowWindow { id: None } => Self::ShowWindow,
++            niri_ipc::Action::ShowWindow { id: Some(id) } => Self::ShowWindowById(id),
++            niri_ipc::Action::ToggleTouchpad {} => Self::ToggleTouchpad,
+             niri_ipc::Action::FullscreenWindow { id: None } => Self::FullscreenWindow,
+             niri_ipc::Action::FullscreenWindow { id: Some(id) } => Self::FullscreenWindowById(id),
+             niri_ipc::Action::ToggleWindowedFullscreen { id: None } => {
+diff --git a/niri-ipc/src/lib.rs b/niri-ipc/src/lib.rs
+index 0aa3cb4f..710bb3b0 100644
+--- a/niri-ipc/src/lib.rs
++++ b/niri-ipc/src/lib.rs
+@@ -119,6 +119,8 @@ pub enum Request {
+     OverviewState,
+     /// Request information about screencasts.
+     Casts,
++    /// Request whether the touchpad is enabled.
++    Touchpad,
+ }
+ 
+ /// Reply from niri to client.
+@@ -165,6 +167,17 @@ pub enum Response {
+     OverviewState(Overview),
+     /// Information about screencasts.
+     Casts(Vec<Cast>),
++    /// Whether the touchpad is enabled.
++    Touchpad(TouchpadState),
++}
++
++/// Touchpad state.
++#[derive(Serialize, Deserialize, Debug, Clone)]
++#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
++pub struct TouchpadState {
++    /// Whether the touchpad is enabled: not `off` in the config and not turned off with
++    /// [`Action::ToggleTouchpad`].
++    pub enabled: bool,
+ }
+ 
+ /// Overview information.
+@@ -294,6 +307,28 @@ pub enum Action {
+         #[cfg_attr(feature = "clap", arg(long))]
+         id: Option<u64>,
+     },
++    /// Hide a window: take it out of its workspace without closing it.
++    ///
++    /// Hidden windows are listed with no workspace id. Bring one back with `show-window`.
++    #[cfg_attr(feature = "clap", clap(about = "Hide the focused window"))]
++    HideWindow {
++        /// Id of the window to hide.
++        ///
++        /// If `None`, uses the focused window.
++        #[cfg_attr(feature = "clap", arg(long))]
++        id: Option<u64>,
++    },
++    /// Show a hidden window on the focused workspace and focus it.
++    #[cfg_attr(feature = "clap", clap(about = "Show the most recently hidden window"))]
++    ShowWindow {
++        /// Id of the hidden window to show.
++        ///
++        /// If `None`, shows the most recently hidden window.
++        #[cfg_attr(feature = "clap", arg(long))]
++        id: Option<u64>,
++    },
++    /// Turn the touchpad off or back on, on top of the config's `touchpad { off }`.
++    ToggleTouchpad {},
+     /// Toggle fullscreen on a window.
+     #[cfg_attr(
+         feature = "clap",
+diff --git a/src/cli.rs b/src/cli.rs
+index 308b3127..a39314c3 100644
+--- a/src/cli.rs
++++ b/src/cli.rs
+@@ -109,6 +109,8 @@ pub enum Msg {
+     OverviewState,
+     /// List screencasts.
+     Casts,
++    /// Print whether the touchpad is on.
++    Touchpad,
+ }
+ 
+ #[derive(Clone, Debug, clap::ValueEnum)]
+diff --git a/src/handlers/compositor.rs b/src/handlers/compositor.rs
+index f38b2934..7b648e03 100644
+--- a/src/handlers/compositor.rs
++++ b/src/handlers/compositor.rs
+@@ -259,6 +259,35 @@ impl CompositorHandler for State {
+                 return;
+             }
+ 
++            // A window hidden with the hide-window action: keep its state current, nothing else.
++            if let Some(mapped) = self.niri.layout.find_hidden(surface) {
++                let window = mapped.window.clone();
++                let id = mapped.id();
++                window.on_commit();
++
++                if !is_mapped(surface) {
++                    // The hidden toplevel got unmapped: it maps afresh like any other.
++                    self.niri.window_mru_ui.remove_window(id);
++                    self.niri.layout.remove_window(&window, Transaction::new());
++                    self.add_default_dmabuf_pre_commit_hook(surface);
++                    let unmapped = Unmapped::new(window);
++                    self.niri.unmapped_windows.insert(surface.clone(), unmapped);
++                    return;
++                }
++
++                let serial = with_states(surface, |states| {
++                    states
++                        .cached_state
++                        .get::<ToplevelCachedState>()
++                        .current()
++                        .last_acked
++                        .as_ref()
++                        .map(|c| c.serial)
++                });
++                self.niri.layout.update_window(&window, serial);
++                return;
++            }
++
+             // This is a commit of a previously-mapped root or a non-toplevel root.
+             if let Some((mapped, output)) = self.niri.layout.find_window_and_output(surface) {
+                 let window = mapped.window.clone();
+diff --git a/src/handlers/xdg_shell.rs b/src/handlers/xdg_shell.rs
+index 38440c90..5559c1c7 100644
+--- a/src/handlers/xdg_shell.rs
++++ b/src/handlers/xdg_shell.rs
+@@ -828,6 +828,21 @@ impl XdgShellHandler for State {
+             return;
+         }
+ 
++        // A window hidden with the hide-window action got destroyed: forget it, nothing to animate.
++        if let Some(mapped) = self.niri.layout.find_hidden(surface.wl_surface()) {
++            let window = mapped.window.clone();
++            let id = mapped.id();
++            self.niri
++                .stop_casts_for_target(CastTarget::Window { id: id.get() });
++            self.niri.window_mru_ui.remove_window(id);
++            self.niri.layout.remove_window(&window, Transaction::new());
++            let surface = surface.wl_surface();
++            if surface.is_alive() {
++                self.add_default_dmabuf_pre_commit_hook(surface);
++            }
++            return;
++        }
++
+         let win_out = self
+             .niri
+             .layout
+diff --git a/src/input/mod.rs b/src/input/mod.rs
+index bdf41e33..0f05b68b 100644
+--- a/src/input/mod.rs
++++ b/src/input/mod.rs
+@@ -230,7 +230,11 @@ impl State {
+                     self.niri.touch.insert(device.clone());
+                 }
+ 
+-                apply_libinput_settings(&self.niri.config.borrow().input, device);
++                apply_libinput_settings(
++                    &self.niri.config.borrow().input,
++                    device,
++                    self.niri.touchpad_off,
++                );
+             }
+             InputEvent::DeviceRemoved { device } => {
+                 self.niri.touch.remove(device);
+@@ -804,11 +808,44 @@ impl State {
+                 }
+             }
+             Action::CloseWindowById(id) => {
+-                let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
+-                if let Some((_, mapped)) = window {
++                let window = self.niri.layout.windows().map(|(_, m)| m);
++                let mut window = window.chain(self.niri.layout.hidden_windows());
++                if let Some(mapped) = window.find(|m| m.id().get() == id) {
+                     mapped.toplevel().send_close();
+                 }
+             }
++            Action::HideWindow => {
++                let focus = self.niri.layout.focus().map(|m| m.window.clone());
++                if let Some(window) = focus {
++                    self.hide_window(&window);
++                }
++            }
++            Action::HideWindowById(id) => {
++                let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
++                let window = window.map(|(_, m)| m.window.clone());
++                if let Some(window) = window {
++                    self.hide_window(&window);
++                }
++            }
++            Action::ShowWindow => self.show_window(None),
++            Action::ShowWindowById(id) => {
++                let window = self
++                    .niri
++                    .layout
++                    .hidden_windows()
++                    .find(|m| m.id().get() == id);
++                let window = window.map(|m| m.window.clone());
++                if let Some(window) = window {
++                    self.show_window(Some(&window));
++                }
++            }
++            Action::ToggleTouchpad => {
++                self.niri.touchpad_off = !self.niri.touchpad_off;
++                let config = self.niri.config.borrow();
++                for mut device in self.niri.devices.iter().cloned() {
++                    apply_libinput_settings(&config.input, &mut device, self.niri.touchpad_off);
++                }
++            }
+             Action::FullscreenWindow => {
+                 let focus = self.niri.layout.focus().map(|m| m.window.clone());
+                 if let Some(window) = focus {
+@@ -4693,12 +4730,17 @@ fn apply_custom_accel(
+     }
+ }
+ 
+-pub fn apply_libinput_settings(config: &niri_config::Input, device: &mut input::Device) {
++/// `touchpad_off`: turned off with the toggle-touchpad action, on top of the config.
++pub fn apply_libinput_settings(
++    config: &niri_config::Input,
++    device: &mut input::Device,
++    touchpad_off: bool,
++) {
+     // According to Mutter code, this setting is specific to touchpads.
+     let is_touchpad = device.config_tap_finger_count() > 0;
+     if is_touchpad {
+         let c = &config.touchpad;
+-        let _ = device.config_send_events_set_mode(if c.off {
++        let _ = device.config_send_events_set_mode(if c.off || touchpad_off {
+             input::SendEventsMode::DISABLED
+         } else if c.disabled_on_external_mouse {
+             input::SendEventsMode::DISABLED_ON_EXTERNAL_MOUSE
+diff --git a/src/ipc/client.rs b/src/ipc/client.rs
+index 40a58efa..8d8fd738 100644
+--- a/src/ipc/client.rs
++++ b/src/ipc/client.rs
+@@ -8,7 +8,8 @@ use niri_config::OutputName;
+ use niri_ipc::socket::Socket;
+ use niri_ipc::{
+     Action, Cast, CastKind, CastTarget, Event, KeyboardLayouts, LogicalOutput, Mode, Output,
+-    OutputConfigChanged, Overview, Request, Response, Transform, Window, WindowLayout,
++    OutputConfigChanged, Overview, Request, Response, TouchpadState, Transform, Window,
++    WindowLayout,
+ };
+ use serde_json::json;
+ 
+@@ -49,6 +50,7 @@ pub fn handle_msg(mut msg: Msg, json: bool) -> anyhow::Result<()> {
+         Msg::RequestError => Request::ReturnError,
+         Msg::OverviewState => Request::OverviewState,
+         Msg::Casts => Request::Casts,
++        Msg::Touchpad => Request::Touchpad,
+     };
+ 
+     let mut socket = Socket::connect().context("error connecting to the niri socket")?;
+@@ -509,6 +511,21 @@ pub fn handle_msg(mut msg: Msg, json: bool) -> anyhow::Result<()> {
+                 }
+             }
+         }
++        Msg::Touchpad => {
++            let Response::Touchpad(response) = response else {
++                bail!("unexpected response: expected Touchpad, got {response:?}");
++            };
++
++            if json {
++                let response =
++                    serde_json::to_string(&response).context("error formatting response")?;
++                println!("{response}");
++                return Ok(());
++            }
++
++            let TouchpadState { enabled } = response;
++            println!("Touchpad is {}", if enabled { "on" } else { "off" });
++        }
+         Msg::OverviewState => {
+             let Response::OverviewState(response) = response else {
+                 bail!("unexpected response: expected Overview, got {response:?}");
+diff --git a/src/ipc/server.rs b/src/ipc/server.rs
+index db71da6d..b2821a7b 100644
+--- a/src/ipc/server.rs
++++ b/src/ipc/server.rs
+@@ -18,7 +18,7 @@ use niri_config::OutputName;
+ use niri_ipc::state::{EventStreamState, EventStreamStatePart as _};
+ use niri_ipc::{
+     Action, Event, KeyboardLayouts, OutputConfigChanged, Overview, Reply, Request, Response,
+-    Timestamp, WindowLayout, Workspace,
++    Timestamp, TouchpadState, WindowLayout, Workspace,
+ };
+ use smithay::desktop::layer_map_for_output;
+ use smithay::input::pointer::{
+@@ -418,6 +418,17 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
+ 
+             Response::OutputConfigChanged(response)
+         }
++        Request::Touchpad => {
++            let (tx, rx) = async_channel::bounded(1);
++            ctx.event_loop.insert_idle(move |state| {
++                let off = state.niri.config.borrow().input.touchpad.off;
++                let enabled = !off && !state.niri.touchpad_off;
++                let _ = tx.send_blocking(enabled);
++            });
++            let enabled = rx.recv().await;
++            let enabled = enabled.map_err(|_| String::from("error getting touchpad state"))?;
++            Response::Touchpad(TouchpadState { enabled })
++        }
+         Request::FocusedOutput => {
+             let (tx, rx) = async_channel::bounded(1);
+             ctx.event_loop.insert_idle(move |state| {
+diff --git a/src/layout/mod.rs b/src/layout/mod.rs
+index 5c4dd639..4a06b2f2 100644
+--- a/src/layout/mod.rs
++++ b/src/layout/mod.rs
+@@ -366,6 +366,9 @@ pub struct Layout<W: LayoutElement> {
+     overview_progress: Option<OverviewProgress>,
+     /// Configurable properties of the layout.
+     options: Rc<Options>,
++    /// Windows hidden with the hide-window action: out of every workspace, but still alive, in the
++    /// order they were hidden.
++    hidden: Vec<RemovedTile<W>>,
+ }
+ 
+ #[derive(Debug)]
+@@ -489,6 +492,7 @@ pub enum ConfigureIntent {
+ }
+ 
+ /// Tile that was just removed from the layout.
++#[derive(Debug)]
+ pub struct RemovedTile<W: LayoutElement> {
+     tile: Tile<W>,
+     /// Width of the column the tile was in.
+@@ -704,6 +708,7 @@ impl<W: LayoutElement> Layout<W> {
+             overview_open: false,
+             overview_progress: None,
+             options: Rc::new(options),
++            hidden: Vec::new(),
+         }
+     }
+ 
+@@ -729,6 +734,7 @@ impl<W: LayoutElement> Layout<W> {
+             overview_open: false,
+             overview_progress: None,
+             options: opts,
++            hidden: Vec::new(),
+         }
+     }
+ 
+@@ -1114,6 +1120,14 @@ impl<W: LayoutElement> Layout<W> {
+         window: &W::Id,
+         transaction: Transaction,
+     ) -> Option<RemovedTile<W>> {
++        if let Some(idx) = self
++            .hidden
++            .iter()
++            .position(|r| r.tile.window().id() == window)
++        {
++            return Some(self.hidden.remove(idx));
++        }
++
+         if let Some(state) = &self.interactive_move {
+             match state {
+                 InteractiveMoveState::Starting { window_id, .. } => {
+@@ -1215,6 +1229,18 @@ impl<W: LayoutElement> Layout<W> {
+     }
+ 
+     pub fn update_window(&mut self, window: &W::Id, serial: Option<Serial>) {
++        if let Some(r) = self
++            .hidden
++            .iter_mut()
++            .find(|r| r.tile.window().id() == window)
++        {
++            if let Some(serial) = serial {
++                r.tile.window_mut().on_commit(serial);
++            }
++            r.tile.update_window();
++            return;
++        }
++
+         if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
+             if move_.tile.window().id() == window {
+                 // Do this before calling update_window() so it can get up-to-date info.
+@@ -1675,6 +1701,11 @@ impl<W: LayoutElement> Layout<W> {
+             f(move_.tile.window(), Some(&move_.output), None, layout);
+         }
+ 
++        // Hidden windows have no output and no workspace.
++        for r in &self.hidden {
++            f(r.tile.window(), None, None, r.tile.ipc_layout_template());
++        }
++
+         match &self.monitor_set {
+             MonitorSet::Normal { monitors, .. } => {
+                 for mon in monitors {
+@@ -1700,6 +1731,10 @@ impl<W: LayoutElement> Layout<W> {
+             f(move_.tile.window_mut(), Some(&move_.output));
+         }
+ 
++        for r in &mut self.hidden {
++            f(r.tile.window_mut(), None);
++        }
++
+         match &mut self.monitor_set {
+             MonitorSet::Normal { monitors, .. } => {
+                 for mon in monitors {
+@@ -4874,6 +4909,13 @@ impl<W: LayoutElement> Layout<W> {
+             });
+         }
+ 
++        for r in &mut self.hidden {
++            let win = r.tile.window_mut();
++            win.set_activated(false);
++            win.send_pending_configure();
++            win.refresh();
++        }
++
+         match &mut self.monitor_set {
+             MonitorSet::Normal {
+                 monitors,
+@@ -4996,6 +5038,77 @@ impl<W: LayoutElement> Layout<W> {
+         moving_window.chain(rest)
+     }
+ 
++    /// Windows hidden with [`Self::hide_window`]. They aren't in [`Self::windows`] or
++    /// [`Self::find_window_and_output`], so actions and requests never reach them; only
++    /// [`Self::with_windows`] (IPC), [`Self::with_windows_mut`], [`Self::update_window`] and
++    /// [`Self::remove_window`] see them.
++    pub fn hidden_windows(&self) -> impl Iterator<Item = &W> {
++        self.hidden.iter().map(|r| r.tile.window())
++    }
++
++    pub fn find_hidden(&self, wl_surface: &WlSurface) -> Option<&W> {
++        self.hidden_windows().find(|w| w.is_wl_surface(wl_surface))
++    }
++
++    /// Hides a window: takes it out of its workspace and keeps it, alive, until
++    /// [`Self::show_window`]. Returns whether the window was hidden.
++    pub fn hide_window(&mut self, window: &W::Id) -> bool {
++        if self.is_hidden(window) {
++            return false;
++        }
++
++        let Some(mut removed) = self.remove_window(window, Transaction::new()) else {
++            return false;
++        };
++        removed.tile.stop_move_animations();
++        self.hidden.push(removed);
++        true
++    }
++
++    /// Shows a hidden window on the active workspace of the active output and focuses it. Without
++    /// an id, shows the most recently hidden window. Returns the window that was shown.
++    pub fn show_window(&mut self, window: Option<&W::Id>) -> Option<W::Id> {
++        let idx = match window {
++            Some(window) => self
++                .hidden
++                .iter()
++                .position(|r| r.tile.window().id() == window),
++            None => self.hidden.len().checked_sub(1),
++        };
++        let idx = idx?;
++
++        let MonitorSet::Normal {
++            monitors,
++            active_monitor_idx,
++            ..
++        } = &mut self.monitor_set
++        else {
++            return None;
++        };
++
++        let removed = self.hidden.remove(idx);
++        let id = removed.tile.window().id().clone();
++        let mon = &mut monitors[*active_monitor_idx];
++        let ws_id = mon.active_workspace_ref().id();
++        mon.add_tile(
++            removed.tile,
++            MonitorAddWindowTarget::Workspace {
++                id: ws_id,
++                column_idx: None,
++            },
++            ActivateWindow::Yes,
++            true,
++            removed.width,
++            removed.is_full_width,
++            removed.is_floating,
++        );
++        Some(id)
++    }
++
++    pub fn is_hidden(&self, window: &W::Id) -> bool {
++        self.hidden.iter().any(|r| r.tile.window().id() == window)
++    }
++
+     pub fn has_window(&self, window: &W::Id) -> bool {
+         self.windows().any(|(_, win)| win.id() == window)
+     }
+diff --git a/src/layout/tests.rs b/src/layout/tests.rs
+index 31265dd9..a9267c6c 100644
+--- a/src/layout/tests.rs
++++ b/src/layout/tests.rs
+@@ -455,6 +455,8 @@ enum Op {
+         ws_name: usize,
+     },
+     CloseWindow(#[proptest(strategy = "1..=5usize")] usize),
++    HideWindow(#[proptest(strategy = "1..=5usize")] usize),
++    ShowWindow(#[proptest(strategy = "prop::option::of(1..=5usize)")] Option<usize>),
+     FullscreenWindow(#[proptest(strategy = "1..=5usize")] usize),
+     SetFullscreenWindow {
+         #[proptest(strategy = "1..=5usize")]
+@@ -757,6 +759,16 @@ enum Op {
+ 
+ impl Op {
+     fn apply(self, layout: &mut Layout<TestWindow>) {
++        // A hidden window keeps its id, like a real window: never add another with the same id.
++        if let Op::AddWindow { params }
++        | Op::AddWindowNextTo { params, .. }
++        | Op::AddWindowToNamedWorkspace { params, .. } = &self
++        {
++            if layout.is_hidden(&params.id) {
++                return;
++            }
++        }
++
+         match self {
+             Op::AddOutput(id) => {
+                 let name = format!("output{id}");
+@@ -1061,6 +1073,12 @@ impl Op {
+             Op::CloseWindow(id) => {
+                 layout.remove_window(&id, Transaction::new());
+             }
++            Op::HideWindow(id) => {
++                layout.hide_window(&id);
++            }
++            Op::ShowWindow(id) => {
++                layout.show_window(id.as_ref());
++            }
+             Op::FullscreenWindow(id) => {
+                 if !layout.has_window(&id) {
+                     return;
+@@ -3929,3 +3947,73 @@ proptest! {
+         check_ops_with_options(options, ops);
+     }
+ }
++
++#[test]
++fn hide_and_show_floating_window() {
++    let mut layout = check_ops([
++        Op::AddOutput(1),
++        Op::AddWindow {
++            params: TestWindowParams::new(1),
++        },
++        Op::AddWindow {
++            params: TestWindowParams {
++                is_floating: true,
++                ..TestWindowParams::new(2)
++            },
++        },
++    ]);
++    assert_eq!(layout.focus().map(|w| *w.id()), Some(2));
++
++    assert!(layout.hide_window(&2));
++    assert!(layout.is_hidden(&2));
++    // Hidden windows are out of reach of actions.
++    assert!(!layout.has_window(&2));
++    assert_eq!(layout.hidden_windows().count(), 1);
++    assert_eq!(layout.focus().map(|w| *w.id()), Some(1));
++    // Hiding twice does nothing.
++    assert!(!layout.hide_window(&2));
++    layout.verify_invariants();
++
++    // Shown on another workspace: comes back floating and focused.
++    check_ops_on_layout(&mut layout, [Op::FocusWorkspaceDown]);
++    assert_eq!(layout.show_window(None), Some(2));
++    assert!(!layout.is_hidden(&2));
++    assert_eq!(layout.focus().map(|w| *w.id()), Some(2));
++    let ws = layout.active_workspace().unwrap();
++    assert!(ws.is_floating(&2));
++    layout.verify_invariants();
++}
++
++#[test]
++fn closing_hidden_window_removes_it() {
++    let mut layout = check_ops([
++        Op::AddOutput(1),
++        Op::AddWindow {
++            params: TestWindowParams::new(1),
++        },
++        Op::HideWindow(1),
++        Op::CloseWindow(1),
++    ]);
++    assert!(!layout.has_window(&1));
++    assert_eq!(layout.hidden_windows().count(), 0);
++    assert_eq!(layout.show_window(None), None);
++    layout.verify_invariants();
++}
++
++#[test]
++fn show_window_without_outputs_keeps_it_hidden() {
++    let mut layout = check_ops([
++        Op::AddOutput(1),
++        Op::AddWindow {
++            params: TestWindowParams::new(1),
++        },
++        Op::HideWindow(1),
++        Op::RemoveOutput(1),
++    ]);
++    assert_eq!(layout.show_window(Some(&1)), None);
++    assert!(layout.is_hidden(&1));
++
++    check_ops_on_layout(&mut layout, [Op::AddOutput(2), Op::ShowWindow(Some(1))]);
++    assert!(!layout.is_hidden(&1));
++    assert_eq!(layout.focus().map(|w| *w.id()), Some(1));
++}
+diff --git a/src/niri.rs b/src/niri.rs
+index ec40e01c..3c5ebe61 100644
+--- a/src/niri.rs
++++ b/src/niri.rs
+@@ -267,6 +267,8 @@ pub struct Niri {
+     pub is_lid_closed: bool,
+ 
+     pub devices: HashSet<input::Device>,
++    /// Touchpad turned off with the toggle-touchpad action (on top of the config).
++    pub touchpad_off: bool,
+     pub tablets: HashMap<input::Device, TabletData>,
+     pub touch: HashSet<input::Device>,
+ 
+@@ -995,6 +997,33 @@ impl State {
+         }
+     }
+ 
++    /// Takes a window out of its workspace without closing it (the hide-window action).
++    pub fn hide_window(&mut self, window: &Window) {
++        let id = self
++            .niri
++            .layout
++            .windows()
++            .find(|(_, m)| &m.window == window);
++        let Some(id) = id.map(|(_, m)| m.id()) else {
++            return;
++        };
++        if self.niri.layout.hide_window(window) {
++            // The MRU switcher would try to focus it.
++            self.niri.window_mru_ui.remove_window(id);
++            self.maybe_warp_cursor_to_focus();
++            self.niri.queue_redraw_all();
++        }
++    }
++
++    /// Brings a hidden window to the focused workspace and focuses it (the show-window action).
++    pub fn show_window(&mut self, window: Option<&Window>) {
++        if let Some(window) = self.niri.layout.show_window(window) {
++            self.niri.layout.start_open_animation_for_window(&window);
++            self.maybe_warp_cursor_to_focus();
++            self.niri.queue_redraw_all();
++        }
++    }
++
+     pub fn maybe_warp_cursor_to_focus(&mut self) -> bool {
+         let focused = match self.niri.config.borrow().input.warp_mouse_to_focus {
+             None => return false,
+@@ -1645,7 +1674,7 @@ impl State {
+         if libinput_config_changed {
+             let config = self.niri.config.borrow();
+             for mut device in self.niri.devices.iter().cloned() {
+-                apply_libinput_settings(&config.input, &mut device);
++                apply_libinput_settings(&config.input, &mut device, self.niri.touchpad_off);
+             }
+         }
+ 
+@@ -2512,6 +2541,7 @@ impl Niri {
+             is_lid_closed: false,
+ 
+             devices: HashSet::new(),
++            touchpad_off: false,
+             tablets: HashMap::new(),
+             touch: HashSet::new(),
+ 
+-- 
+2.54.0
+

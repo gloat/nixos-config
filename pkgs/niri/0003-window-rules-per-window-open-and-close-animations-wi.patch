@@ -1,0 +1,588 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: gloat <4354076+gloat@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 08:59:54 -0500
+Subject: [PATCH] window rules: per-window open and close animations
+ (window-open, window-close)
+
+A window rule can carry its own window-open / window-close block, same syntax as in animations {},
+replacing the global animation for matching windows: duration, curve or spring, off, and
+custom-shader. Without a custom-shader the rule uses niri's built-in animation. Rule shaders are
+compiled on first use, once per distinct source, and cached for the session (ProgramType::Rule).
+---
+ niri-config/src/lib.rs            | 35 +++++++++++++
+ niri-config/src/window_rule.rs    |  8 +++
+ src/layout/closing_window.rs      | 15 +++---
+ src/layout/floating.rs            | 17 +++----
+ src/layout/mod.rs                 |  5 +-
+ src/layout/opening_window.rs      | 10 ++--
+ src/layout/scrolling.rs           | 17 +++----
+ src/layout/tile.rs                | 31 +++++++++---
+ src/layout/workspace.rs           |  7 ++-
+ src/render_helpers/shaders/mod.rs | 81 +++++++++++++++++++++++++++++++
+ src/window/mod.rs                 | 14 ++++++
+ 11 files changed, 202 insertions(+), 38 deletions(-)
+
+diff --git a/niri-config/src/lib.rs b/niri-config/src/lib.rs
+index 22a72ce2..c1724e7c 100644
+--- a/niri-config/src/lib.rs
++++ b/niri-config/src/lib.rs
+@@ -1890,6 +1890,8 @@ mod tests {
+                             saturation: None,
+                         },
+                     },
++                    window_open: None,
++                    window_close: None,
+                 },
+             ],
+             layer_rules: [
+@@ -2467,4 +2469,37 @@ mod tests {
+         "#,
+         );
+     }
++
++    #[test]
++    fn window_rule_animations() {
++        let parsed = do_parse(
++            r#"
++            window-rule {
++                match app-id="popup"
++                window-open {
++                    duration-ms 90
++                    custom-shader "vec4 open_color(vec3 c, vec3 s) { return vec4(0.0); }"
++                }
++                window-close { off; }
++            }
++            "#,
++        );
++        let rule = &parsed.window_rules[0];
++        let open = rule.window_open.as_ref().unwrap();
++        assert!(open
++            .custom_shader
++            .as_deref()
++            .unwrap()
++            .contains("open_color"));
++        assert!(matches!(
++            open.anim.kind,
++            animations::Kind::Easing(animations::EasingParams {
++                duration_ms: 90,
++                ..
++            })
++        ));
++        let close = rule.window_close.as_ref().unwrap();
++        assert!(close.anim.off);
++        assert_eq!(close.custom_shader, None);
++    }
+ }
+diff --git a/niri-config/src/window_rule.rs b/niri-config/src/window_rule.rs
+index f2bc2ad1..7b2aa5ee 100644
+--- a/niri-config/src/window_rule.rs
++++ b/niri-config/src/window_rule.rs
+@@ -1,5 +1,6 @@
+ use niri_ipc::ColumnDisplay;
+ 
++use crate::animations::{WindowCloseAnim, WindowOpenAnim};
+ use crate::appearance::{
+     BackgroundEffect, BackgroundEffectRule, BlockOutFrom, BorderRule, CornerRadius, ShadowRule,
+     TabIndicatorRule,
+@@ -79,6 +80,13 @@ pub struct WindowRule {
+     pub background_effect: BackgroundEffectRule,
+     #[knuffel(child, default)]
+     pub popups: PopupsRule,
++    /// Open animation for matching windows, replacing the global `animations { window-open }`.
++    /// Fields left out take niri's defaults, and no `custom-shader` means niri's built-in one.
++    #[knuffel(child)]
++    pub window_open: Option<WindowOpenAnim>,
++    /// Close animation for matching windows, replacing the global `animations { window-close }`.
++    #[knuffel(child)]
++    pub window_close: Option<WindowCloseAnim>,
+ }
+ 
+ /// Rules for popup surfaces.
+diff --git a/src/layout/closing_window.rs b/src/layout/closing_window.rs
+index ca28f598..2302ea34 100644
+--- a/src/layout/closing_window.rs
++++ b/src/layout/closing_window.rs
+@@ -18,7 +18,7 @@ use crate::animation::Animation;
+ use crate::niri_render_elements;
+ use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
+ use crate::render_helpers::shader_element::ShaderRenderElement;
+-use crate::render_helpers::shaders::{mat3_uniform, ProgramType, Shaders};
++use crate::render_helpers::shaders::{mat3_uniform, AnimShader};
+ use crate::render_helpers::snapshot::RenderSnapshot;
+ use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
+ use crate::render_helpers::{render_to_encompassing_texture, RenderCtx, RenderTarget};
+@@ -59,6 +59,9 @@ pub struct ClosingWindow {
+     /// The closing animation.
+     anim_state: AnimationState,
+ 
++    /// The shader the closing animation draws with.
++    shader: AnimShader,
++
+     /// Random seed for the shader.
+     random_seed: f32,
+ }
+@@ -94,6 +97,7 @@ impl AnimationState {
+ }
+ 
+ impl ClosingWindow {
++    #[allow(clippy::too_many_arguments)]
+     pub fn new<E: RenderElement<GlesRenderer>>(
+         renderer: &mut GlesRenderer,
+         snapshot: RenderSnapshot<E, E>,
+@@ -102,6 +106,7 @@ impl ClosingWindow {
+         pos: Point<f64, Logical>,
+         blocker: TransactionBlocker,
+         anim: Animation,
++        shader: AnimShader,
+     ) -> anyhow::Result<Self> {
+         let _span = tracy_client::span!("ClosingWindow::new");
+ 
+@@ -154,6 +159,7 @@ impl ClosingWindow {
+             blocked_out_buffer_offset,
+             anim_state: AnimationState::new(blocker, anim),
+             random_seed: fastrand::f32(),
++            shader,
+         })
+     }
+ 
+@@ -223,10 +229,7 @@ impl ClosingWindow {
+         let progress = anim.value();
+         let clamped_progress = anim.clamped_value().clamp(0., 1.);
+ 
+-        if Shaders::get(ctx.renderer)
+-            .program(ProgramType::Close)
+-            .is_some()
+-        {
++        if let Some(program) = self.shader.program(ctx.renderer, false) {
+             let area_loc = Vec2::new(view_rect.loc.x as f32, view_rect.loc.y as f32);
+             let area_size = Vec2::new(view_rect.size.w as f32, view_rect.size.h as f32);
+ 
+@@ -251,7 +254,7 @@ impl ClosingWindow {
+                 Mat3::from_translation(-tex_loc / tex_size) * Mat3::from_scale(geo_size / tex_size);
+ 
+             return ShaderRenderElement::new(
+-                ProgramType::Close,
++                program,
+                 view_rect.size,
+                 None,
+                 scale.x as f32,
+diff --git a/src/layout/floating.rs b/src/layout/floating.rs
+index d102f40d..7218f3b0 100644
+--- a/src/layout/floating.rs
++++ b/src/layout/floating.rs
+@@ -18,6 +18,7 @@ use super::{
+ use crate::animation::{Animation, Clock};
+ use crate::niri_render_elements;
+ use crate::render_helpers::renderer::NiriRenderer;
++use crate::render_helpers::shaders::AnimShader;
+ use crate::render_helpers::xray::XrayPos;
+ use crate::render_helpers::RenderCtx;
+ use crate::utils::transaction::TransactionBlocker;
+@@ -557,8 +558,11 @@ impl<W: LayoutElement> FloatingSpace<W> {
+         };
+ 
+         let tile_size = tile.tile_size();
++        let close_anim = tile.close_animation();
+ 
+-        self.start_close_animation_for_tile(renderer, snapshot, tile_size, tile_pos, blocker);
++        self.start_close_animation_for_tile(
++            renderer, snapshot, tile_size, tile_pos, blocker, close_anim,
++        );
+     }
+ 
+     pub fn activate_window_without_raising(&mut self, id: &W::Id) -> bool {
+@@ -598,14 +602,9 @@ impl<W: LayoutElement> FloatingSpace<W> {
+         tile_size: Size<f64, Logical>,
+         tile_pos: Point<f64, Logical>,
+         blocker: TransactionBlocker,
++        (config, shader): (niri_config::Animation, AnimShader),
+     ) {
+-        let anim = Animation::new(
+-            self.clock.clone(),
+-            0.,
+-            1.,
+-            0.,
+-            self.options.animations.window_close.anim,
+-        );
++        let anim = Animation::new(self.clock.clone(), 0., 1., 0., config);
+ 
+         let blocker = if self.options.disable_transactions {
+             TransactionBlocker::completed()
+@@ -615,7 +614,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
+ 
+         let scale = Scale::from(self.scale);
+         let res = ClosingWindow::new(
+-            renderer, snapshot, scale, tile_size, tile_pos, blocker, anim,
++            renderer, snapshot, scale, tile_size, tile_pos, blocker, anim, shader,
+         );
+         match res {
+             Ok(closing) => {
+diff --git a/src/layout/mod.rs b/src/layout/mod.rs
+index 4a06b2f2..ec67103e 100644
+--- a/src/layout/mod.rs
++++ b/src/layout/mod.rs
+@@ -4797,6 +4797,7 @@ impl<W: LayoutElement> Layout<W> {
+                 };
+                 let tile_pos = move_.tile_render_location(zoom);
+                 let tile_size = move_.tile.tile_size();
++                let close_anim = move_.tile.close_animation();
+ 
+                 let output = move_.output.clone();
+                 let pointer_pos_within_output = move_.pointer_pos_within_output;
+@@ -4814,7 +4815,9 @@ impl<W: LayoutElement> Layout<W> {
+                     .unwrap();
+ 
+                 let tile_pos = tile_pos - ws_geo.loc;
+-                ws.start_close_animation_for_tile(renderer, snapshot, tile_size, tile_pos, blocker);
++                ws.start_close_animation_for_tile(
++                    renderer, snapshot, tile_size, tile_pos, blocker, close_anim,
++                );
+                 return;
+             }
+         }
+diff --git a/src/layout/opening_window.rs b/src/layout/opening_window.rs
+index 5ba97a35..30a9b9e7 100644
+--- a/src/layout/opening_window.rs
++++ b/src/layout/opening_window.rs
+@@ -15,11 +15,12 @@ use crate::animation::Animation;
+ use crate::niri_render_elements;
+ use crate::render_helpers::offscreen::{OffscreenBuffer, OffscreenData, OffscreenRenderElement};
+ use crate::render_helpers::shader_element::ShaderRenderElement;
+-use crate::render_helpers::shaders::{mat3_uniform, ProgramType, Shaders};
++use crate::render_helpers::shaders::{mat3_uniform, AnimShader};
+ 
+ #[derive(Debug)]
+ pub struct OpenAnimation {
+     anim: Animation,
++    shader: AnimShader,
+     random_seed: f32,
+     buffer: OffscreenBuffer,
+ }
+@@ -32,9 +33,10 @@ niri_render_elements! {
+ }
+ 
+ impl OpenAnimation {
+-    pub fn new(anim: Animation) -> Self {
++    pub fn new(anim: Animation, shader: AnimShader) -> Self {
+         Self {
+             anim,
++            shader,
+             random_seed: fastrand::f32(),
+             buffer: OffscreenBuffer::default(),
+         }
+@@ -63,7 +65,7 @@ impl OpenAnimation {
+             .render(renderer, scale, elements)
+             .context("error rendering to offscreen buffer")?;
+ 
+-        if Shaders::get(renderer).program(ProgramType::Open).is_some() {
++        if let Some(program) = self.shader.program(renderer, true) {
+             // OffscreenBuffer renders with Transform::Normal and the scale that we passed, so we
+             // can assume that below.
+             let offset = elem.offset();
+@@ -98,7 +100,7 @@ impl OpenAnimation {
+                 Mat3::from_translation(-tex_loc / tex_size) * Mat3::from_scale(geo_size / tex_size);
+ 
+             let elem = ShaderRenderElement::new(
+-                ProgramType::Open,
++                program,
+                 area.size,
+                 None,
+                 scale.x as f32,
+diff --git a/src/layout/scrolling.rs b/src/layout/scrolling.rs
+index 007bcaf5..51b129ca 100644
+--- a/src/layout/scrolling.rs
++++ b/src/layout/scrolling.rs
+@@ -21,6 +21,7 @@ use crate::input::swipe_tracker::SwipeTracker;
+ use crate::layout::SizingMode;
+ use crate::niri_render_elements;
+ use crate::render_helpers::renderer::NiriRenderer;
++use crate::render_helpers::shaders::AnimShader;
+ use crate::render_helpers::xray::XrayPos;
+ use crate::render_helpers::RenderCtx;
+ use crate::utils::transaction::{Transaction, TransactionBlocker};
+@@ -1461,6 +1462,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+         };
+ 
+         let tile_size = tile.tile_size();
++        let close_anim = tile.close_animation();
+ 
+         let (col_idx, tile_idx) = self
+             .columns
+@@ -1503,7 +1505,9 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+             tile_pos.x -= offset;
+         }
+ 
+-        self.start_close_animation_for_tile(renderer, snapshot, tile_size, tile_pos, blocker);
++        self.start_close_animation_for_tile(
++            renderer, snapshot, tile_size, tile_pos, blocker, close_anim,
++        );
+     }
+ 
+     fn start_close_animation_for_tile(
+@@ -1513,14 +1517,9 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+         tile_size: Size<f64, Logical>,
+         tile_pos: Point<f64, Logical>,
+         blocker: TransactionBlocker,
++        (config, shader): (niri_config::Animation, AnimShader),
+     ) {
+-        let anim = Animation::new(
+-            self.clock.clone(),
+-            0.,
+-            1.,
+-            0.,
+-            self.options.animations.window_close.anim,
+-        );
++        let anim = Animation::new(self.clock.clone(), 0., 1., 0., config);
+ 
+         let blocker = if self.options.disable_transactions {
+             TransactionBlocker::completed()
+@@ -1530,7 +1529,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+ 
+         let scale = Scale::from(self.scale);
+         let res = ClosingWindow::new(
+-            renderer, snapshot, scale, tile_size, tile_pos, blocker, anim,
++            renderer, snapshot, scale, tile_size, tile_pos, blocker, anim, shader,
+         );
+         match res {
+             Ok(closing) => {
+diff --git a/src/layout/tile.rs b/src/layout/tile.rs
+index 86c7ebad..3a60611b 100644
+--- a/src/layout/tile.rs
++++ b/src/layout/tile.rs
+@@ -25,6 +25,7 @@ use crate::render_helpers::damage::ExtraDamage;
+ use crate::render_helpers::offscreen::{OffscreenBuffer, OffscreenRenderElement};
+ use crate::render_helpers::renderer::NiriRenderer;
+ use crate::render_helpers::resize::ResizeRenderElement;
++use crate::render_helpers::shaders::AnimShader;
+ use crate::render_helpers::shadow::ShadowRenderElement;
+ use crate::render_helpers::snapshot::RenderSnapshot;
+ use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
+@@ -559,13 +560,29 @@ impl<W: LayoutElement> Tile<W> {
+     }
+ 
+     pub fn start_open_animation(&mut self) {
+-        self.open_animation = Some(OpenAnimation::new(Animation::new(
+-            self.clock.clone(),
+-            0.,
+-            1.,
+-            0.,
+-            self.options.animations.window_open.anim,
+-        )));
++        let (config, shader) = match &self.window.rules().window_open {
++            Some(rule) => (
++                rule.anim,
++                AnimShader::from_rule(rule.custom_shader.as_deref()),
++            ),
++            None => (self.options.animations.window_open.anim, AnimShader::Global),
++        };
++        let anim = Animation::new(self.clock.clone(), 0., 1., 0., config);
++        self.open_animation = Some(OpenAnimation::new(anim, shader));
++    }
++
++    /// The close animation for this tile's window: its window rule's, or the global one.
++    pub fn close_animation(&self) -> (niri_config::Animation, AnimShader) {
++        match &self.window.rules().window_close {
++            Some(rule) => (
++                rule.anim,
++                AnimShader::from_rule(rule.custom_shader.as_deref()),
++            ),
++            None => (
++                self.options.animations.window_close.anim,
++                AnimShader::Global,
++            ),
++        }
+     }
+ 
+     pub fn resize_animation(&self) -> Option<&Animation> {
+diff --git a/src/layout/workspace.rs b/src/layout/workspace.rs
+index 49548a83..b12a8483 100644
+--- a/src/layout/workspace.rs
++++ b/src/layout/workspace.rs
+@@ -30,6 +30,7 @@ use super::{
+ use crate::animation::Clock;
+ use crate::niri_render_elements;
+ use crate::render_helpers::renderer::NiriRenderer;
++use crate::render_helpers::shaders::AnimShader;
+ use crate::render_helpers::shadow::ShadowRenderElement;
+ use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
+ use crate::render_helpers::xray::{Xray, XrayPos};
+@@ -1744,9 +1745,11 @@ impl<W: LayoutElement> Workspace<W> {
+         tile_size: Size<f64, Logical>,
+         tile_pos: Point<f64, Logical>,
+         blocker: TransactionBlocker,
++        close_anim: (niri_config::Animation, AnimShader),
+     ) {
+-        self.floating
+-            .start_close_animation_for_tile(renderer, snapshot, tile_size, tile_pos, blocker);
++        self.floating.start_close_animation_for_tile(
++            renderer, snapshot, tile_size, tile_pos, blocker, close_anim,
++        );
+     }
+ 
+     pub fn start_open_animation(&mut self, id: &W::Id) -> bool {
+diff --git a/src/render_helpers/shaders/mod.rs b/src/render_helpers/shaders/mod.rs
+index 7be9b159..555f9a59 100644
+--- a/src/render_helpers/shaders/mod.rs
++++ b/src/render_helpers/shaders/mod.rs
+@@ -1,4 +1,5 @@
+ use std::cell::RefCell;
++use std::rc::Rc;
+ 
+ use glam::Mat3;
+ use smithay::backend::renderer::gles::{
+@@ -21,6 +22,46 @@ pub struct Shaders {
+     pub custom_resize: RefCell<Option<ShaderProgram>>,
+     pub custom_close: RefCell<Option<ShaderProgram>>,
+     pub custom_open: RefCell<Option<ShaderProgram>>,
++    /// Window rules' open and close shaders, compiled on first use and kept for the session
++    /// (`None`: failed to compile). Indexed by [`ProgramType::Rule`].
++    pub rule_programs: RefCell<Vec<RuleProgram>>,
++}
++
++pub struct RuleProgram {
++    is_open: bool,
++    src: Rc<str>,
++    program: Option<ShaderProgram>,
++}
++
++/// Which shader a window's open or close animation draws with.
++#[derive(Debug, Clone, PartialEq)]
++pub enum AnimShader {
++    /// The global `animations` custom-shader, if there is one.
++    Global,
++    /// A window rule's animation: its custom-shader, or `None` for niri's built-in animation.
++    Rule(Option<Rc<str>>),
++}
++
++impl AnimShader {
++    pub fn from_rule(custom_shader: Option<&str>) -> Self {
++        Self::Rule(custom_shader.map(Rc::from))
++    }
++
++    /// The program to draw with, or `None` for the built-in animation.
++    pub fn program(&self, renderer: &mut GlesRenderer, is_open: bool) -> Option<ProgramType> {
++        match self {
++            AnimShader::Global => {
++                let ty = if is_open {
++                    ProgramType::Open
++                } else {
++                    ProgramType::Close
++                };
++                Shaders::get(renderer).program(ty).map(|_| ty)
++            }
++            AnimShader::Rule(None) => None,
++            AnimShader::Rule(Some(src)) => rule_program(renderer, is_open, src),
++        }
++    }
+ }
+ 
+ #[derive(Debug, Clone, Copy)]
+@@ -30,6 +71,8 @@ pub enum ProgramType {
+     Resize,
+     Close,
+     Open,
++    /// A window rule's open or close shader, an index into `Shaders::rule_programs`.
++    Rule(usize),
+ }
+ 
+ impl Shaders {
+@@ -159,6 +202,7 @@ impl Shaders {
+             custom_resize: RefCell::new(None),
+             custom_close: RefCell::new(None),
+             custom_open: RefCell::new(None),
++            rule_programs: RefCell::new(Vec::new()),
+         }
+     }
+ 
+@@ -207,6 +251,10 @@ impl Shaders {
+                 .or_else(|| self.resize.clone()),
+             ProgramType::Close => self.custom_close.borrow().clone(),
+             ProgramType::Open => self.custom_open.borrow().clone(),
++            ProgramType::Rule(idx) => {
++                let programs = self.rule_programs.borrow();
++                programs.get(idx).and_then(|p| p.program.clone())
++            }
+         }
+     }
+ }
+@@ -353,6 +401,39 @@ pub fn set_custom_open_program(renderer: &mut GlesRenderer, src: Option<&str>) {
+     }
+ }
+ 
++/// A window rule's open or close shader, compiled once per distinct source.
++fn rule_program(renderer: &mut GlesRenderer, is_open: bool, src: &Rc<str>) -> Option<ProgramType> {
++    let programs = Shaders::get(renderer).rule_programs.borrow();
++    let found = programs
++        .iter()
++        .position(|p| p.is_open == is_open && p.src == *src);
++    if let Some(idx) = found {
++        return programs[idx]
++            .program
++            .is_some()
++            .then_some(ProgramType::Rule(idx));
++    }
++    drop(programs);
++
++    let program = if is_open {
++        compile_open_program(renderer, src)
++    } else {
++        compile_close_program(renderer, src)
++    };
++    let program = program
++        .map_err(|err| warn!("error compiling a window rule's animation shader: {err:?}"))
++        .ok();
++
++    let mut programs = Shaders::get(renderer).rule_programs.borrow_mut();
++    let ok = program.is_some();
++    programs.push(RuleProgram {
++        is_open,
++        src: src.clone(),
++        program,
++    });
++    ok.then_some(ProgramType::Rule(programs.len() - 1))
++}
++
+ pub fn mat3_uniform(name: &str, mat: Mat3) -> Uniform<'_> {
+     Uniform::new(
+         name,
+diff --git a/src/window/mod.rs b/src/window/mod.rs
+index 14527cd2..27706b86 100644
+--- a/src/window/mod.rs
++++ b/src/window/mod.rs
+@@ -1,5 +1,6 @@
+ use std::cmp::{max, min};
+ 
++use niri_config::animations::{WindowCloseAnim, WindowOpenAnim};
+ use niri_config::utils::MergeWith as _;
+ use niri_config::window_rule::{Match, WindowRule};
+ use niri_config::{
+@@ -125,6 +126,12 @@ pub struct ResolvedWindowRules {
+ 
+     /// Rules for this window's popups.
+     pub popups: ResolvedPopupsRules,
++
++    /// Open animation replacing the global one.
++    pub window_open: Option<WindowOpenAnim>,
++
++    /// Close animation replacing the global one.
++    pub window_close: Option<WindowCloseAnim>,
+ }
+ 
+ impl<'a> WindowRef<'a> {
+@@ -308,6 +315,13 @@ impl ResolvedWindowRules {
+                     .merge_with(&rule.background_effect);
+ 
+                 resolved.popups.merge_with(&rule.popups);
++
++                if let Some(x) = &rule.window_open {
++                    resolved.window_open = Some(x.clone());
++                }
++                if let Some(x) = &rule.window_close {
++                    resolved.window_close = Some(x.clone());
++                }
+             }
+ 
+             resolved.open_on_output = open_on_output.map(|x| x.to_owned());
+-- 
+2.54.0
+

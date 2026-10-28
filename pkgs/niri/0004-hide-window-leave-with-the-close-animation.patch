@@ -1,0 +1,116 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: gloat <4354076+gloat@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 09:21:03 -0500
+Subject: [PATCH] hide-window: leave with the close animation
+
+The window's unmap snapshot is taken and its close animation (window rule or global) started
+before it is taken out of the layout, so hiding looks like closing and showing like opening.
+---
+ src/layout/mod.rs   |  4 ++--
+ src/layout/tests.rs |  6 +++---
+ src/niri.rs         | 26 ++++++++++++++++++++++----
+ 3 files changed, 27 insertions(+), 9 deletions(-)
+
+diff --git a/src/layout/mod.rs b/src/layout/mod.rs
+index ec67103e..e4e04cca 100644
+--- a/src/layout/mod.rs
++++ b/src/layout/mod.rs
+@@ -5055,12 +5055,12 @@ impl<W: LayoutElement> Layout<W> {
+ 
+     /// Hides a window: takes it out of its workspace and keeps it, alive, until
+     /// [`Self::show_window`]. Returns whether the window was hidden.
+-    pub fn hide_window(&mut self, window: &W::Id) -> bool {
++    pub fn hide_window(&mut self, window: &W::Id, transaction: Transaction) -> bool {
+         if self.is_hidden(window) {
+             return false;
+         }
+ 
+-        let Some(mut removed) = self.remove_window(window, Transaction::new()) else {
++        let Some(mut removed) = self.remove_window(window, transaction) else {
+             return false;
+         };
+         removed.tile.stop_move_animations();
+diff --git a/src/layout/tests.rs b/src/layout/tests.rs
+index a9267c6c..82ade9a3 100644
+--- a/src/layout/tests.rs
++++ b/src/layout/tests.rs
+@@ -1074,7 +1074,7 @@ impl Op {
+                 layout.remove_window(&id, Transaction::new());
+             }
+             Op::HideWindow(id) => {
+-                layout.hide_window(&id);
++                layout.hide_window(&id, Transaction::new());
+             }
+             Op::ShowWindow(id) => {
+                 layout.show_window(id.as_ref());
+@@ -3964,14 +3964,14 @@ fn hide_and_show_floating_window() {
+     ]);
+     assert_eq!(layout.focus().map(|w| *w.id()), Some(2));
+ 
+-    assert!(layout.hide_window(&2));
++    assert!(layout.hide_window(&2, Transaction::new()));
+     assert!(layout.is_hidden(&2));
+     // Hidden windows are out of reach of actions.
+     assert!(!layout.has_window(&2));
+     assert_eq!(layout.hidden_windows().count(), 1);
+     assert_eq!(layout.focus().map(|w| *w.id()), Some(1));
+     // Hiding twice does nothing.
+-    assert!(!layout.hide_window(&2));
++    assert!(!layout.hide_window(&2, Transaction::new()));
+     layout.verify_invariants();
+ 
+     // Shown on another workspace: comes back floating and focused.
+diff --git a/src/niri.rs b/src/niri.rs
+index 3c5ebe61..6b67201c 100644
+--- a/src/niri.rs
++++ b/src/niri.rs
+@@ -173,6 +173,7 @@ use crate::ui::screen_transition::{self, ScreenTransition};
+ use crate::ui::screenshot_ui::{OutputScreenshot, ScreenshotUi, ScreenshotUiRenderElement};
+ use crate::utils::scale::{closest_representable_scale, guess_monitor_scale};
+ use crate::utils::spawning::{CHILD_DISPLAY, CHILD_ENV};
++use crate::utils::transaction::Transaction;
+ use crate::utils::vblank_throttle::VBlankThrottle;
+ use crate::utils::watcher::Watcher;
+ use crate::utils::xwayland::satellite::Satellite;
+@@ -997,17 +998,34 @@ impl State {
+         }
+     }
+ 
+-    /// Takes a window out of its workspace without closing it (the hide-window action).
++    /// Takes a window out of its workspace without closing it (the hide-window action). It leaves
++    /// with its close animation (its window rule's window-close, or the global one).
+     pub fn hide_window(&mut self, window: &Window) {
+-        let id = self
++        let found = self
+             .niri
+             .layout
+             .windows()
+             .find(|(_, m)| &m.window == window);
+-        let Some(id) = id.map(|(_, m)| m.id()) else {
++        let Some((mon, mapped)) = found else {
+             return;
+         };
+-        if self.niri.layout.hide_window(window) {
++        let id = mapped.id();
++        let output = mon.map(|mon| mon.output().clone());
++
++        self.store_unmap_snapshot(window, output.as_ref());
++        let transaction = Transaction::new();
++        let blocker = transaction.blocker();
++        self.backend.with_primary_renderer(|renderer| {
++            self.niri
++                .layout
++                .start_close_animation_for_window(renderer, window, blocker);
++        });
++
++        let hidden = self.niri.layout.hide_window(window, transaction.clone());
++        if !transaction.is_last() {
++            transaction.register_deadline_timer(&self.niri.event_loop);
++        }
++        if hidden {
+             // The MRU switcher would try to focus it.
+             self.niri.window_mru_ui.remove_window(id);
+             self.maybe_warp_cursor_to_focus();
+-- 
+2.54.0
+

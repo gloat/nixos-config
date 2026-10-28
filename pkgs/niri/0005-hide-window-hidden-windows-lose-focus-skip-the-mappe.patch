@@ -1,0 +1,66 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: gloat <4354076+gloat@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 10:17:05 -0500
+Subject: [PATCH] hide-window: hidden windows lose focus; skip the mapped
+ pre-commit hook quietly
+
+A hidden window kept is_focused, so IPC saw two focused windows and sent
+WindowFocusChanged back and forth on every refresh (~140k events/s),
+which ran noctalia out of memory.
+---
+ src/handlers/xdg_shell.rs | 4 ++++
+ src/layout/mod.rs         | 7 +++++++
+ src/niri.rs               | 4 ++++
+ 3 files changed, 15 insertions(+)
+
+diff --git a/src/handlers/xdg_shell.rs b/src/handlers/xdg_shell.rs
+index 5559c1c7..bb377573 100644
+--- a/src/handlers/xdg_shell.rs
++++ b/src/handlers/xdg_shell.rs
+@@ -1459,6 +1459,10 @@ pub fn add_mapped_toplevel_pre_commit_hook(toplevel: &ToplevelSurface) -> HookId
+             trace_span!("toplevel pre-commit", surface = %surface.id(), serial = Empty).entered();
+ 
+         let Some((mapped, output)) = state.niri.layout.find_window_and_output_mut(surface) else {
++            // Hidden with hide-window: not drawn, so there's nothing to synchronize.
++            if state.niri.layout.find_hidden(surface).is_some() {
++                return;
++            }
+             error!("pre-commit hook for mapped surfaces must be removed upon unmapping");
+             return;
+         };
+diff --git a/src/layout/mod.rs b/src/layout/mod.rs
+index e4e04cca..0f39db4d 100644
+--- a/src/layout/mod.rs
++++ b/src/layout/mod.rs
+@@ -5053,6 +5053,13 @@ impl<W: LayoutElement> Layout<W> {
+         self.hidden_windows().find(|w| w.is_wl_surface(wl_surface))
+     }
+ 
++    pub fn find_hidden_mut(&mut self, wl_surface: &WlSurface) -> Option<&mut W> {
++        self.hidden
++            .iter_mut()
++            .map(|r| r.tile.window_mut())
++            .find(|w| w.is_wl_surface(wl_surface))
++    }
++
+     /// Hides a window: takes it out of its workspace and keeps it, alive, until
+     /// [`Self::show_window`]. Returns whether the window was hidden.
+     pub fn hide_window(&mut self, window: &W::Id, transaction: Transaction) -> bool {
+diff --git a/src/niri.rs b/src/niri.rs
+index 6b67201c..72aa0391 100644
+--- a/src/niri.rs
++++ b/src/niri.rs
+@@ -1307,6 +1307,10 @@ impl State {
+             {
+                 if let Some((mapped, _)) = self.niri.layout.find_window_and_output_mut(surface) {
+                     mapped.set_is_focused(false);
++                } else if let Some(mapped) = self.niri.layout.find_hidden_mut(surface) {
++                    // Hidden with hide-window: it must lose focus too, or IPC sees two focused
++                    // windows and floods WindowFocusChanged back and forth.
++                    mapped.set_is_focused(false);
+                 }
+             }
+             if let KeyboardFocus::Layout {
+-- 
+2.54.0
+

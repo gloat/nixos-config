@@ -1,0 +1,302 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: gloat <4354076+gloat@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 14:54:01 -0500
+Subject: [PATCH] layout: fill-single-column, a lone column fills the view
+
+New layout flag. While a column is the only one in its scrolling space it
+is shown full-width; with two or more, each column uses its own width.
+The first window on an empty workspace gets a full-width initial
+configure, so it opens at that size instead of resizing after mapping.
+
+Columns keep an is_only_column flag that add_column and
+remove_column_by_idx update (every column insert and removal goes through
+them), checked in verify_invariants. The stored width is unchanged, so
+Mod+R on a lone column takes effect once a second column joins.
+---
+ niri-config/src/layout.rs |  5 +++
+ niri-config/src/lib.rs    |  1 +
+ src/layout/scrolling.rs   | 47 +++++++++++++++++++++-
+ src/layout/tests.rs       | 83 +++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 135 insertions(+), 1 deletion(-)
+
+diff --git a/niri-config/src/layout.rs b/niri-config/src/layout.rs
+index f84528bd..8f0fcd82 100644
+--- a/niri-config/src/layout.rs
++++ b/niri-config/src/layout.rs
+@@ -19,6 +19,7 @@ pub struct Layout {
+     pub preset_window_heights: Vec<PresetSize>,
+     pub center_focused_column: CenterFocusedColumn,
+     pub always_center_single_column: bool,
++    pub fill_single_column: bool,
+     pub empty_workspace_above_first: bool,
+     pub default_column_display: ColumnDisplay,
+     pub gaps: f64,
+@@ -42,6 +43,7 @@ impl Default for Layout {
+             default_column_width: Some(PresetSize::Proportion(0.5)),
+             center_focused_column: CenterFocusedColumn::Never,
+             always_center_single_column: false,
++            fill_single_column: false,
+             empty_workspace_above_first: false,
+             default_column_display: ColumnDisplay::Normal,
+             gaps: 16.,
+@@ -66,6 +68,7 @@ impl MergeWith<LayoutPart> for Layout {
+             tab_indicator,
+             insert_hint,
+             always_center_single_column,
++            fill_single_column,
+             empty_workspace_above_first,
+             gaps,
+         );
+@@ -117,6 +120,8 @@ pub struct LayoutPart {
+     #[knuffel(child)]
+     pub always_center_single_column: Option<Flag>,
+     #[knuffel(child)]
++    pub fill_single_column: Option<Flag>,
++    #[knuffel(child)]
+     pub empty_workspace_above_first: Option<Flag>,
+     #[knuffel(child, unwrap(argument, str))]
+     pub default_column_display: Option<ColumnDisplay>,
+diff --git a/niri-config/src/lib.rs b/niri-config/src/lib.rs
+index c1724e7c..9283d74d 100644
+--- a/niri-config/src/lib.rs
++++ b/niri-config/src/lib.rs
+@@ -1450,6 +1450,7 @@ mod tests {
+                 ],
+                 center_focused_column: OnOverflow,
+                 always_center_single_column: false,
++                fill_single_column: false,
+                 empty_workspace_above_first: false,
+                 default_column_display: Tabbed,
+                 gaps: 8.0,
+diff --git a/src/layout/scrolling.rs b/src/layout/scrolling.rs
+index 51b129ca..3a797ecc 100644
+--- a/src/layout/scrolling.rs
++++ b/src/layout/scrolling.rs
+@@ -170,6 +170,12 @@ pub struct Column<W: LayoutElement> {
+     /// Whether this column is full-width.
+     is_full_width: bool,
+ 
++    /// Whether this is the only column in its scrolling space.
++    ///
++    /// With fill-single-column, such a column is shown full-width. The scrolling space keeps this
++    /// up to date as columns come and go.
++    is_only_column: bool,
++
+     /// Whether this column is going to be fullscreen.
+     ///
+     /// This is the compositor-side fullscreen state, so it changes immediately upon
+@@ -499,6 +505,13 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+ 
+         let working_size = self.working_area.size;
+ 
++        // With fill-single-column, the first window on a workspace opens full-width.
++        let width = if self.options.layout.fill_single_column && self.columns.is_empty() {
++            Some(PresetSize::Proportion(1.))
++        } else {
++            width
++        };
++
+         let width = if let Some(size) = width {
+             let size = match resolve_preset_size(size, &self.options, working_size.w, extra.w) {
+                 ResolvedSize::Tile(mut size) => {
+@@ -987,6 +1000,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+         );
+         self.data.insert(idx, ColumnData::new(&column));
+         self.columns.insert(idx, column);
++        self.update_only_column();
+ 
+         if !was_empty && idx <= self.active_column_idx {
+             self.active_column_idx += 1;
+@@ -1024,6 +1038,21 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+         }
+     }
+ 
++    /// Updates `is_only_column` after columns were added or removed, resizing columns that start
++    /// or stop filling the view.
++    fn update_only_column(&mut self) {
++        let is_only = self.columns.len() == 1;
++        for col in &mut self.columns {
++            if col.is_only_column != is_only {
++                col.is_only_column = is_only;
++                if col.options.layout.fill_single_column {
++                    col.update_tile_sizes(true);
++                    cancel_resize_for_column(&mut self.interactive_resize, col);
++                }
++            }
++        }
++    }
++
+     pub fn remove_active_tile(&mut self, transaction: Transaction) -> Option<RemovedTile<W>> {
+         if self.columns.is_empty() {
+             return None;
+@@ -1180,6 +1209,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+ 
+         let column = self.columns.remove(column_idx);
+         self.data.remove(column_idx);
++        self.update_only_column();
+ 
+         // Stop interactive resize.
+         if let Some(resize) = &self.interactive_resize {
+@@ -3761,6 +3791,11 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+                 assert!(Rc::ptr_eq(&self.options, &column.options));
+                 assert_eq!(self.clock, column.clock);
+                 assert_eq!(self.scale, column.scale);
++                assert_eq!(
++                    column.is_only_column,
++                    self.columns.len() == 1,
++                    "is_only_column must match the column count"
++                );
+                 column.verify_invariants();
+ 
+                 let mut data2 = *data;
+@@ -3965,6 +4000,7 @@ impl<W: LayoutElement> Column<W> {
+             width,
+             preset_width_idx,
+             is_full_width,
++            is_only_column: false,
+             is_pending_maximized: false,
+             is_pending_fullscreen: false,
+             display_mode,
+@@ -4034,6 +4070,10 @@ impl<W: LayoutElement> Column<W> {
+             update_sizes = true;
+         }
+ 
++        if self.options.layout.fill_single_column != options.layout.fill_single_column {
++            update_sizes = true;
++        }
++
+         if self.options.layout.border.off != options.layout.border.off
+             || self.options.layout.border.width != options.layout.border.width
+         {
+@@ -4475,7 +4515,7 @@ impl<W: LayoutElement> Column<W> {
+             .unwrap_or(f64::from(i32::MAX));
+         let max_width = f64::max(max_width, min_width);
+ 
+-        let width = if self.is_full_width {
++        let width = if self.is_full_width || self.is_filling() {
+             ColumnWidth::Proportion(1.)
+         } else {
+             self.width
+@@ -4843,6 +4883,11 @@ impl<W: LayoutElement> Column<W> {
+         self.preset_width_idx = Some(preset_idx);
+     }
+ 
++    /// Whether fill-single-column shows this column full-width.
++    fn is_filling(&self) -> bool {
++        self.is_only_column && self.options.layout.fill_single_column
++    }
++
+     fn toggle_full_width(&mut self) {
+         if self.is_pending_maximized {
+             // Treat it as unmaximize.
+diff --git a/src/layout/tests.rs b/src/layout/tests.rs
+index 82ade9a3..c7c0e806 100644
+--- a/src/layout/tests.rs
++++ b/src/layout/tests.rs
+@@ -3403,6 +3403,87 @@ fn preset_column_width_fixed_correct_with_border() {
+     assert_eq!(win.requested_size().unwrap().w, 500);
+ }
+ 
++#[test]
++fn fill_single_column() {
++    let options = Options {
++        layout: niri_config::Layout {
++            fill_single_column: true,
++            ..Default::default()
++        },
++        ..Default::default()
++    };
++    let width = |layout: &Layout<TestWindow>, id: usize| {
++        let (_, win) = layout.windows().find(|(_, win)| win.0.id == id).unwrap();
++        win.requested_size().unwrap().w
++    };
++
++    // The first window on a workspace opens full-width.
++    let mut layout = check_ops_with_options(options.clone(), [Op::AddOutput(1)]);
++    let size = layout.active_workspace().unwrap().new_window_size(
++        Some(PresetSize::Proportion(0.5)),
++        None,
++        false,
++        &ResolvedWindowRules::default(),
++        (Size::default(), Size::default()),
++    );
++    assert_eq!(size.w, 1248);
++
++    // A lone column fills the view.
++    check_ops_on_layout(
++        &mut layout,
++        [Op::AddWindow {
++            params: TestWindowParams::new(0),
++        }],
++    );
++    assert_eq!(width(&layout, 0), 1248);
++
++    // The next window opens at its own width.
++    let size = layout.active_workspace().unwrap().new_window_size(
++        Some(PresetSize::Proportion(0.5)),
++        None,
++        false,
++        &ResolvedWindowRules::default(),
++        (Size::default(), Size::default()),
++    );
++    assert_eq!(size.w, 616);
++
++    // With two columns, each uses its own width (test windows open at their own 100 px).
++    check_ops_on_layout(
++        &mut layout,
++        [Op::AddWindow {
++            params: TestWindowParams::new(1),
++        }],
++    );
++    assert_eq!(width(&layout, 0), 100);
++    assert_eq!(width(&layout, 1), 100);
++
++    // The column left alone fills the view again.
++    check_ops_on_layout(&mut layout, [Op::CloseWindow(0)]);
++    assert_eq!(width(&layout, 1), 1248);
++
++    // Moving it to an empty workspace keeps it full-width; the next column it joins does not.
++    check_ops_on_layout(
++        &mut layout,
++        [
++            Op::AddWindow {
++                params: TestWindowParams::new(2),
++            },
++            Op::MoveColumnToWorkspaceDown(true),
++        ],
++    );
++    assert_eq!(width(&layout, 1), 1248);
++    assert_eq!(width(&layout, 2), 1248);
++    check_ops_on_layout(&mut layout, [Op::MoveColumnToWorkspaceUp(true)]);
++    assert_eq!(width(&layout, 1), 100);
++    assert_eq!(width(&layout, 2), 100);
++
++    // Turning the option off resizes right away.
++    check_ops_on_layout(&mut layout, [Op::CloseWindow(1)]);
++    assert_eq!(width(&layout, 2), 1248);
++    layout.update_options(Options::default());
++    assert_eq!(width(&layout, 2), 100);
++}
++
+ #[test]
+ fn preset_column_width_reset_after_set_width() {
+     let ops = [
+@@ -3905,6 +3986,7 @@ prop_compose! {
+         tab_indicator in prop::option::of(arbitrary_tab_indicator()),
+         center_focused_column in prop::option::of(arbitrary_center_focused_column()),
+         always_center_single_column in prop::option::of(any::<bool>().prop_map(Flag)),
++        fill_single_column in prop::option::of(any::<bool>().prop_map(Flag)),
+         empty_workspace_above_first in prop::option::of(any::<bool>().prop_map(Flag)),
+     ) -> niri_config::LayoutPart {
+         niri_config::LayoutPart {
+@@ -3912,6 +3994,7 @@ prop_compose! {
+             struts,
+             center_focused_column,
+             always_center_single_column,
++            fill_single_column,
+             empty_workspace_above_first,
+             focus_ring,
+             border,
+-- 
+2.54.0
+
